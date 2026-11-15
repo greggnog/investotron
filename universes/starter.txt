@@ -1,0 +1,62 @@
+# Starter universe: ~40 US stocks, mostly mid caps with eventful earnings,
+# spread across sectors. Small enough to fetch from Tiingo's free tier in one go.
+#
+# Survivorship bias: these are companies that exist *today*. Companies that went
+# bankrupt or were acquired since 2015 are missing, which flatters any results.
+# Fine for building the pipeline; fix it before trusting conclusions.
+
+# Consumer / retail
+DECK
+CROX
+ELF
+FIVE
+ULTA
+DKS
+BBY
+ETSY
+CHWY
+W
+CVNA
+
+# Restaurants
+CMG
+TXRH
+WING
+SHAK
+DPZ
+
+# Tech / software
+ROKU
+ZM
+DOCU
+TWLO
+OKTA
+PINS
+SNAP
+U
+
+# Fintech
+AFRM
+UPST
+SOFI
+HOOD
+COIN
+
+# Energy / clean tech
+FSLR
+ENPH
+RUN
+
+# Health
+MRNA
+VRTX
+REGN
+
+# Industrials / travel
+AAL
+CAR
+UBER
+
+# Large caps for contrast
+AAPL
+MSFT

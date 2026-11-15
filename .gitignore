@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+
+# Downloaded and derived data -- reproducible from the scripts, and can get large
+data/

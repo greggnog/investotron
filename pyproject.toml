@@ -1,0 +1,65 @@
+[project]
+name = "investotron"
+version = "0.1.0"
+description = "Research tool: do public events (SEC filings, news, ...) predict stock moves?"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28",
+    "numpy>=2.2", # polars' type hints reference numpy; also needed for the statistics
+    "polars>=1.20",
+    "tzdata>=2025.1", # Windows has no system tz database; zoneinfo needs this
+]
+
+[project.scripts]
+investotron = "investotron.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.400",
+    "pytest>=8.3",
+    "ruff>=0.11",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F",  # pycodestyle + pyflakes
+    "I",            # import sorting
+    "B",            # bugbear: likely bugs
+    "UP",           # use modern syntax
+    "SIM",          # simplifications
+    "N",            # naming
+    "ANN",          # require type annotations
+    "DTZ",          # forbid naive datetimes -- important for point-in-time data
+    "PT",           # pytest style
+    "PL",           # pylint
+    "RUF",
+]
+
+ignore = [
+    # Raw JSON from external APIs really is untyped. It's annotated `Any` only up
+    # to the parse functions, which turn it into typed objects.
+    "ANN401",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004"] # magic numbers are fine in assertions
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.13"
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
