@@ -14,10 +14,12 @@ import polars as pl
 
 from investotron.event_study import (
     ALL_ITEMS,
+    BETA_SESSIONS,
     DEFAULT_HORIZONS,
-    MIN_BASELINE_SESSIONS,
+    MIN_BETA_SESSIONS,
     NULL_MEAN_ABS_Z,
     NULL_SHARE_ABOVE_2,
+    Model,
     aligned_prices,
     attach_surprises,
     event_reactions,
@@ -141,7 +143,13 @@ def fetch_prices(tickers: list[Ticker], start: date, refresh: bool, paths: Paths
 
 def _show(title: str, frame: pl.DataFrame) -> None:
     print(f"\n{title}")
-    with pl.Config(tbl_rows=-1, tbl_hide_dataframe_shape=True, tbl_hide_column_data_types=True):
+    with pl.Config(
+        tbl_rows=-1,
+        tbl_cols=-1,
+        tbl_width_chars=200,
+        tbl_hide_dataframe_shape=True,
+        tbl_hide_column_data_types=True,
+    ):
         print(frame)
 
 
@@ -157,7 +165,9 @@ def _direction_table(summary: pl.DataFrame, label: pl.Expr) -> pl.DataFrame:
         "n",
         (pl.col("mean") * PCT).round(2).alias("mean %"),
         (pl.col("median") * PCT).round(2).alias("median %"),
+        pl.col("t_naive").round(2).alias("t naive"),
         pl.col("t_stat").round(2).alias("t"),
+        pl.col("clusters").alias("weeks"),
         (pl.col("hit_rate") * PCT).round(0).alias("hit %"),
     )
 
@@ -174,16 +184,39 @@ def _reaction_table(summary: pl.DataFrame, label: pl.Expr) -> pl.DataFrame:
     )
 
 
-def event_study(
-    tickers: list[Ticker],
-    benchmark: Ticker,
-    horizons: list[int],
-    min_events: int,
-    paths: Paths,
-) -> None:
-    if not paths.prices(benchmark).exists():
-        sys.exit(f"Missing {benchmark} prices -- run `investotron fetch-prices {benchmark}`.")
-    bench = pl.read_parquet(paths.prices(benchmark))
+def _print_multiple_comparisons(summary: pl.DataFrame) -> None:
+    """How many rows clear |t| > 2, vs how many would by luck alone."""
+    rows = summary.filter(pl.col("group") != ALL_ITEMS).drop_nulls("t_stat")
+    hits = rows.filter(pl.col("t_stat").abs() > 2).height  # noqa: PLR2004
+    expected = rows.height * NULL_SHARE_ABOVE_2
+    print(
+        f"   {hits} of {rows.height} item rows have |t| > 2; about {expected:.1f} would by "
+        "chance alone, and rows at different horizons of the same item aren't independent."
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StudyConfig:
+    benchmark: Ticker
+    horizons: list[int]
+    min_events: int
+    model: Model
+
+
+@dataclass(frozen=True, slots=True)
+class StudyData:
+    returns: pl.DataFrame
+    reactions: pl.DataFrame
+    earnings: pl.DataFrame | None  # earnings 8-Ks with SUE, if any EPS data exists
+
+
+def _load_study(tickers: list[Ticker], config: StudyConfig, paths: Paths) -> StudyData:
+    if not paths.prices(config.benchmark).exists():
+        sys.exit(
+            f"Missing {config.benchmark} prices -- run "
+            f"`investotron fetch-prices {config.benchmark}`."
+        )
+    bench = pl.read_parquet(paths.prices(config.benchmark))
 
     returns: list[pl.DataFrame] = []
     reactions: list[pl.DataFrame] = []
@@ -196,8 +229,8 @@ def event_study(
         filings = pl.read_parquet(paths.filings(ticker)).with_columns(
             pl.lit(ticker.value).alias("ticker")
         )
-        prices = aligned_prices(pl.read_parquet(paths.prices(ticker)), bench)
-        returns.append(event_returns(filings, prices, horizons))
+        prices = aligned_prices(pl.read_parquet(paths.prices(ticker)), bench, config.model)
+        returns.append(event_returns(filings, prices, config.horizons))
         reactions.append(event_reactions(filings, prices))
         if paths.eps(ticker).exists():
             quarters = eps_from_frame(pl.read_parquet(paths.eps(ticker)))
@@ -208,65 +241,81 @@ def event_study(
         sys.exit("No tickers have both 8-K and price data yet.")
     if missing:
         print(f"Skipped (not fetched yet): {', '.join(missing)}")
-
-    all_returns = pl.concat(returns)
-    all_reactions = pl.concat(reactions)
-    tag = tickers[0].value if len(tickers) == 1 else f"{len(tickers)}_tickers"
-    _write(all_returns, paths.results(f"event_returns_{tag}_vs_{benchmark}.parquet"))
-    _write(all_reactions, paths.results(f"event_reactions_{tag}_vs_{benchmark}.parquet"))
-
-    n_tickers = all_returns["ticker"].n_unique()
-    n_events = all_returns.select("ticker", "accession_number").n_unique()
-    print(
-        f"{n_tickers} ticker(s), {n_events} 8-Ks ({all_reactions.height} with the "
-        f"{MIN_BASELINE_SESSIONS}+ sessions of history the size test needs), "
-        f"benchmark {benchmark}"
+    earnings = (
+        pl.concat(surprised).with_columns(surprise_bucket(pl.col("sue")).alias("surprise"))
+        if surprised
+        else None
     )
-    keep = (pl.col("group") == ALL_ITEMS) | (pl.col("n") >= min_events)
+    return StudyData(pl.concat(returns), pl.concat(reactions), earnings)
 
+
+def _print_header(data: StudyData, config: StudyConfig) -> None:
+    n_tickers = data.returns["ticker"].n_unique()
+    n_events = data.returns.select("ticker", "accession_number").n_unique()
+    print(
+        f"{n_tickers} ticker(s), {n_events} 8-Ks ({data.reactions.height} with the "
+        f"history the size test needs), benchmark {config.benchmark}"
+    )
+    if config.model is Model.BETA:
+        betas = data.returns.unique(["ticker", "accession_number"])["beta"]
+        print(
+            f"Model: trailing {BETA_SESSIONS}-session beta (median {betas.median():.2f}, "
+            f"middle half {betas.quantile(0.25):.2f}..{betas.quantile(0.75):.2f}); "
+            f"a stock's first {MIN_BETA_SESSIONS} sessions have no beta yet and are skipped"
+        )
+    else:
+        print("Model: market-adjusted (beta = 1)")
+
+
+def _print_surprise_section(data: StudyData) -> None:
+    if data.earnings is None:
+        print("\n3) SURPRISE: no EPS data yet -- run `investotron fetch-edgar` for these tickers.")
+        return
+    rated = data.earnings.drop_nulls("surprise").select("ticker", "accession_number", "surprise")
+    print(
+        f"\n3) SURPRISE: {data.earnings.height} earnings 8-Ks, {rated.height} with a SUE "
+        "(needs ~2 years of EPS history first)"
+    )
+    keys = ["ticker", "accession_number"]
+    label = pl.lit("")
+    _show(
+        "   Size of the reaction, by surprise (SUE <= -1 miss, >= +1 beat)",
+        _reaction_table(
+            summarize_reactions(data.reactions.join(rated, on=keys), by="surprise"), label
+        ),
+    )
+    _show(
+        "   Direction after entry, by surprise",
+        _direction_table(summarize(data.returns.join(rated, on=keys), by="surprise"), label),
+    )
+
+
+def event_study(tickers: list[Ticker], config: StudyConfig, paths: Paths) -> None:
+    data = _load_study(tickers, config, paths)
+
+    tag = tickers[0].value if len(tickers) == 1 else f"{len(tickers)}_tickers"
+    tag = f"{tag}_vs_{config.benchmark}_{config.model}"
+    _write(data.returns, paths.results(f"event_returns_{tag}.parquet"))
+    _write(data.reactions, paths.results(f"event_reactions_{tag}.parquet"))
+
+    _print_header(data, config)
+    keep = (pl.col("group") == ALL_ITEMS) | (pl.col("n") >= config.min_events)
+    direction = summarize(data.returns).filter(keep)
     _show(
         "1) DIRECTION: abnormal return from the first open after the filing "
-        f"(items with n >= {min_events})",
-        _direction_table(summarize(all_returns).filter(keep), _describe(pl.col("group"))),
+        f"(items with n >= {config.min_events}; t clustered by calendar weeks)",
+        _direction_table(direction, _describe(pl.col("group"))),
     )
+    _print_multiple_comparisons(direction)
     _show(
         "2) SIZE: move from last close before the filing to the entry-day close, "
         f"vs normal volatility (no-news reference: mean |z| ~{NULL_MEAN_ABS_Z:.1f}, "
         f"|z|>2 ~{NULL_SHARE_ABOVE_2:.0%})",
         _reaction_table(
-            summarize_reactions(all_reactions).filter(keep), _describe(pl.col("group"))
+            summarize_reactions(data.reactions).filter(keep), _describe(pl.col("group"))
         ),
     )
-
-    if not surprised:
-        print("\n3) SURPRISE: no EPS data yet -- run `investotron fetch-edgar` for these tickers.")
-        return
-    earnings = pl.concat(surprised).with_columns(surprise_bucket(pl.col("sue")).alias("surprise"))
-    rated = earnings.drop_nulls("surprise")
-    print(
-        f"\n3) SURPRISE: {earnings.height} earnings 8-Ks, {rated.height} with a SUE "
-        "(needs ~2 years of EPS history first)"
-    )
-    surprise_returns = summarize(
-        all_returns.join(
-            rated.select("ticker", "accession_number", "surprise"),
-            on=["ticker", "accession_number"],
-        ),
-        by="surprise",
-    )
-    surprise_reactions = summarize_reactions(
-        all_reactions.join(
-            rated.select("ticker", "accession_number", "surprise"),
-            on=["ticker", "accession_number"],
-        ),
-        by="surprise",
-    )
-    label = pl.lit("")
-    _show(
-        "   Size of the reaction, by surprise (SUE <= -1 miss, >= +1 beat)",
-        _reaction_table(surprise_reactions, label),
-    )
-    _show("   Direction after entry, by surprise", _direction_table(surprise_returns, label))
+    _print_surprise_section(data)
 
 
 # --- argument parsing ---------------------------------------------------------
@@ -305,6 +354,13 @@ def main(argv: list[str] | None = None) -> None:
         "--horizons", type=int, nargs="+", default=list(DEFAULT_HORIZONS), metavar="DAYS"
     )
     study.add_argument("--min-events", type=int, default=5, help="hide groups with fewer events")
+    study.add_argument(
+        "--model",
+        type=Model,
+        choices=list(Model),
+        default=Model.BETA,
+        help="expected-return model: trailing beta (default) or beta = 1",
+    )
 
     args = parser.parse_args(argv)
     try:
@@ -318,4 +374,5 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "fetch-prices":
         fetch_prices(tickers, args.start, args.refresh, paths)
     elif args.command == "event-study":
-        event_study(tickers, args.benchmark, args.horizons, args.min_events, paths)
+        config = StudyConfig(args.benchmark, args.horizons, args.min_events, args.model)
+        event_study(tickers, config, paths)

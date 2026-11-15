@@ -9,8 +9,7 @@ Two questions, two measures:
    exactly 9:30:00 misses that day's opening auction, hence "strictly".
 2. For a horizon of ``h`` sessions, **exit** is the close of session ``entry + h - 1``,
    so ``h = 1`` means "open to close on the first tradable day".
-3. **Abnormal return** = stock return minus benchmark return over the same window
-   (a "market-adjusted" model: it assumes beta = 1. Good enough for a first look).
+3. **Abnormal return** = stock return - beta x benchmark return over the same window.
 
 **Size (not tradable, but tells you whether the event mattered).** :func:`event_reactions`.
 Measured from the last close *before* the event to the close of the entry session,
@@ -19,48 +18,98 @@ happens. Scaled by the stock's normal day-to-day abnormal volatility over the
 preceding sessions, giving a z-score. If events carried no news, |z| would average
 about 0.8 and exceed 2 about 5% of the time.
 
-Caveats when reading results:
+**Beta.** With :attr:`Model.BETA` (the default), beta is the slope of the stock's
+daily returns on the benchmark's over the previous ``BETA_SESSIONS`` sessions,
+using only closes before the window starts -- so it's point-in-time too. There's no
+intercept (alpha): a year of past outperformance is mostly noise, and extrapolating
+it would bake momentum into "expected" returns. :attr:`Model.MARKET` fixes beta = 1,
+the simpler "market-adjusted" model, kept for comparison.
 
-* Windows of nearby events overlap, and events in the same week across stocks share
-  market moves, so they aren't independent and t-stats overstate confidence.
-* One filing usually has several items (2.02 earnings + 9.01 exhibits), so it's
-  counted once under each.
+**Standard errors.** Events aren't independent: earnings seasons put many stocks'
+windows in the same weeks, and a 20-day window overlaps the next few weeks' events.
+``t_stat`` clusters events by calendar block (one week for horizons up to 5 days,
+``ceil(h / 5)`` weeks beyond that), which allows any correlation within a block.
+Correlation between neighbouring blocks is still ignored, so it's an improvement,
+not a guarantee. ``t_naive`` is the old independent-events version, for comparison.
+
+One filing usually has several items (2.02 earnings + 9.01 exhibits), so it's
+counted once under each.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import timedelta
+from enum import StrEnum
 
 import polars as pl
 
 DEFAULT_HORIZONS = (1, 5, 20)
 EARNINGS_ITEM = "2.02"
 MAX_REPORT_LAG = timedelta(days=75)  # quarter end -> earnings release
+# Longest normal gap between an event and the next open (a holiday weekend). Events
+# with no session that soon -- before the price history starts, or during a gap in
+# it -- are dropped rather than matched to a session days or years later.
+MAX_ENTRY_DELAY = timedelta(days=5)
 ALL_ITEMS = "all"
 BASELINE_SESSIONS = 60
 MIN_BASELINE_SESSIONS = 40
+BETA_SESSIONS = 250  # about a year
+MIN_BETA_SESSIONS = 120
 
 # Reference values for |z| when an event carries no information (standard normal).
 NULL_MEAN_ABS_Z = 0.798
 NULL_SHARE_ABOVE_2 = 0.046
 
+_FIRST_MONDAY = 4  # 1970-01-05, in days since the epoch; calendar blocks start Mondays
+_SESSIONS_PER_WEEK = 5
+
+
+class Model(StrEnum):
+    BETA = "beta"
+    MARKET = "market"
+
+
+@dataclass(frozen=True, slots=True)
+class Windows:
+    """Trailing windows (in sessions) for beta and normal volatility, with the
+    minimum history each needs before it's trusted."""
+
+    beta_sessions: int = BETA_SESSIONS
+    min_beta_sessions: int = MIN_BETA_SESSIONS
+    baseline_sessions: int = BASELINE_SESSIONS
+    min_baseline_sessions: int = MIN_BASELINE_SESSIONS
+
 
 def aligned_prices(
     stock: pl.DataFrame,
     benchmark: pl.DataFrame,
-    baseline_sessions: int = BASELINE_SESSIONS,
-    min_baseline_sessions: int = MIN_BASELINE_SESSIONS,
+    model: Model = Model.BETA,
+    windows: Windows = Windows(),
 ) -> pl.DataFrame:
     """Sessions both series have, numbered 0..n-1 so horizons count trading days.
 
-    Adds ``daily_abnormal`` (close-to-close stock minus benchmark return) and
-    ``baseline_std``: its standard deviation over the ``baseline_sessions`` up to
-    and including that session -- i.e. only data available at that session's close.
+    Adds, all using only data up to that session's close:
+
+    * ``beta`` -- trailing beta of the stock on the benchmark (1.0 for ``Model.MARKET``).
+    * ``daily_abnormal`` -- close-to-close stock return minus the *previous* session's
+      beta times the benchmark return.
+    * ``baseline_std`` -- standard deviation of ``daily_abnormal`` over the last
+      ``windows.baseline_sessions``.
     """
-    daily_abnormal = (pl.col("adj_close") / pl.col("adj_close").shift(1)) - (
-        pl.col("bench_adj_close") / pl.col("bench_adj_close").shift(1)
-    )
+    w = windows
+    stock_daily = pl.col("adj_close") / pl.col("adj_close").shift(1) - 1
+    bench_daily = pl.col("bench_adj_close") / pl.col("bench_adj_close").shift(1) - 1
+    if model is Model.BETA:
+        beta = pl.rolling_cov(
+            "stock_daily",
+            "bench_daily",
+            window_size=w.beta_sessions,
+            min_samples=w.min_beta_sessions,
+        ) / pl.col("bench_daily").rolling_var(w.beta_sessions, min_samples=w.min_beta_sessions)
+    else:
+        beta = pl.lit(1.0)
     return (
         stock.select("session", "opens_at", "closes_at", "adj_open", "adj_close")
         .join(
@@ -74,17 +123,24 @@ def aligned_prices(
         )
         .sort("session")
         .with_row_index("session_index")
-        .with_columns(daily_abnormal.alias("daily_abnormal"))
+        .with_columns(stock_daily.alias("stock_daily"), bench_daily.alias("bench_daily"))
+        .with_columns(beta.alias("beta"))
+        .with_columns(
+            (pl.col("stock_daily") - pl.col("beta").shift(1) * pl.col("bench_daily")).alias(
+                "daily_abnormal"
+            )
+        )
         .with_columns(
             pl.col("daily_abnormal")
-            .rolling_std(baseline_sessions, min_samples=min_baseline_sessions)
+            .rolling_std(w.baseline_sessions, min_samples=w.min_baseline_sessions)
             .alias("baseline_std")
         )
     )
 
 
 def _with_entry(events: pl.DataFrame, prices: pl.DataFrame) -> pl.DataFrame:
-    """Attach the first session opening strictly after ``known_at``."""
+    """Attach the first session opening strictly after ``known_at`` (within
+    ``MAX_ENTRY_DELAY``), plus the beta known at the close before it (``entry_beta``)."""
     return (
         events.sort("known_at")
         .join_asof(
@@ -94,11 +150,13 @@ def _with_entry(events: pl.DataFrame, prices: pl.DataFrame) -> pl.DataFrame:
                 pl.col("session").alias("entry_session"),
                 pl.col("adj_open").alias("entry_open"),
                 pl.col("bench_adj_open").alias("bench_entry_open"),
+                pl.col("beta").shift(1).alias("entry_beta"),
             ),
             left_on="known_at",
             right_on="opens_at",
             strategy="forward",
             allow_exact_matches=False,
+            tolerance=MAX_ENTRY_DELAY,
             coalesce=False,
         )
         .drop("opens_at")
@@ -115,13 +173,13 @@ def event_returns(
 
     ``events`` needs ``accession_number``, ``items`` and ``known_at`` (extra
     columns are carried through); ``prices`` comes from :func:`aligned_prices`.
-    Events with no later session to enter on, or whose exit is past the end of the
-    data, are left out of that horizon.
+    Events with no later session to enter on, no beta yet, or whose exit is past
+    the end of the data, are left out of that horizon.
     """
     if not horizons or min(horizons) < 1:
         raise ValueError(f"horizons must be >= 1, got {list(horizons)}")
 
-    entries = _with_entry(events, prices)
+    entries = _with_entry(events, prices).drop_nulls("entry_beta").rename({"entry_beta": "beta"})
     exits = prices.select(
         pl.col("session_index").alias("exit_index"),
         pl.col("session").alias("exit_session"),
@@ -143,7 +201,7 @@ def event_returns(
         .with_columns(
             stock_return.alias("stock_return"),
             bench_return.alias("bench_return"),
-            (stock_return - bench_return).alias("abnormal_return"),
+            (stock_return - pl.col("beta") * bench_return).alias("abnormal_return"),
         )
         .drop(
             "entry_index",
@@ -161,13 +219,14 @@ def event_reactions(events: pl.DataFrame, prices: pl.DataFrame) -> pl.DataFrame:
     """One row per event: abnormal move from the last close before it to the close
     of the entry session, and that move as a z-score against normal volatility.
 
-    Events without enough prior history for a baseline are dropped.
+    Events without enough prior history for a beta and a baseline are dropped.
     """
     starts = prices.select(
         "closes_at",
         pl.col("session_index").alias("start_index"),
         pl.col("adj_close").alias("start_close"),
         pl.col("bench_adj_close").alias("bench_start_close"),
+        "beta",
         "baseline_std",
     )
     ends = prices.select(
@@ -175,9 +234,8 @@ def event_reactions(events: pl.DataFrame, prices: pl.DataFrame) -> pl.DataFrame:
         pl.col("adj_close").alias("end_close"),
         pl.col("bench_adj_close").alias("bench_end_close"),
     )
-    reaction = (pl.col("end_close") / pl.col("start_close")) - (
-        pl.col("bench_end_close") / pl.col("bench_start_close")
-    )
+    stock_move = pl.col("end_close") / pl.col("start_close") - 1
+    bench_move = pl.col("bench_end_close") / pl.col("bench_start_close") - 1
     sessions = (pl.col("entry_index") - pl.col("start_index")).cast(pl.Float64)
     return (
         _with_entry(events, prices)
@@ -188,10 +246,10 @@ def event_reactions(events: pl.DataFrame, prices: pl.DataFrame) -> pl.DataFrame:
             strategy="backward",  # last close at or before the event
             coalesce=False,
         )
-        .drop_nulls("baseline_std")
+        .drop_nulls(["baseline_std", "beta"])
         .join(ends, on="entry_index", how="inner")
         .with_columns(
-            reaction.alias("reaction"),
+            (stock_move - pl.col("beta") * bench_move).alias("reaction"),
             sessions.alias("reaction_sessions"),
         )
         .with_columns((pl.col("reaction") / (pl.col("baseline_std") * sessions.sqrt())).alias("z"))
@@ -206,6 +264,7 @@ def event_reactions(events: pl.DataFrame, prices: pl.DataFrame) -> pl.DataFrame:
                 "bench_end_close",
                 "entry_open",
                 "bench_entry_open",
+                "entry_beta",
             )
         )
         .sort("known_at")
@@ -223,23 +282,49 @@ def _by_group(frame: pl.DataFrame, by: str) -> pl.DataFrame:
     return pl.concat([everything, per_value])
 
 
+def calendar_block(entry_session: pl.Expr, horizon: pl.Expr) -> pl.Expr:
+    """Cluster id: Monday-aligned blocks of ``max(1, ceil(horizon / 5))`` weeks, so
+    each block is about as long as the return windows that start in it."""
+    weeks = pl.max_horizontal(pl.lit(1), (horizon + _SESSIONS_PER_WEEK - 1) // _SESSIONS_PER_WEEK)
+    days = entry_session.cast(pl.Int32) - _FIRST_MONDAY
+    return days // (weeks * 7)
+
+
 def summarize(returns: pl.DataFrame, by: str = "items") -> pl.DataFrame:
     """Abnormal-return statistics per group and horizon, plus an "all" row.
 
-    ``t_stat`` is mean / standard error -- roughly, |t| > 2 suggests the average
-    isn't zero by luck, *if* events were independent (see module caveats).
+    ``t_stat`` is clustered by calendar block (see module docstring); |t| > 2 is
+    roughly "unlikely to be luck" for a *single* pre-chosen row. ``t_naive`` assumes
+    independent events and is shown for comparison.
     """
+    keys = ["group", "horizon"]
     abnormal = pl.col("abnormal_return")
+    rows = _by_group(returns, by).with_columns(
+        calendar_block(pl.col("entry_session"), pl.col("horizon")).alias("cluster")
+    )
+    stats = rows.group_by(keys).agg(
+        pl.len().alias("n"),
+        pl.col("cluster").n_unique().alias("clusters"),
+        abnormal.mean().alias("mean"),
+        abnormal.median().alias("median"),
+        (abnormal.mean() / (abnormal.std() / pl.len().sqrt())).alias("t_naive"),
+        (abnormal > 0).mean().alias("hit_rate"),
+    )
+    # Cluster-robust variance of the mean: sum over clusters of (sum of residuals)^2,
+    # with the usual G / (G - 1) small-sample correction.
+    cluster_sums = (
+        rows.join(stats.select(*keys, "mean"), on=keys)
+        .group_by(*keys, "cluster")
+        .agg((abnormal - pl.col("mean")).sum().alias("residual_sum"))
+        .group_by(keys)
+        .agg((pl.col("residual_sum") ** 2).sum().alias("sum_sq"))
+    )
+    g = pl.col("clusters")
+    clustered_se = (pl.col("sum_sq") * g / (g - 1)).sqrt() / pl.col("n")
     return (
-        _by_group(returns, by)
-        .group_by("group", "horizon")
-        .agg(
-            pl.len().alias("n"),
-            abnormal.mean().alias("mean"),
-            abnormal.median().alias("median"),
-            (abnormal.mean() / (abnormal.std() / pl.len().sqrt())).alias("t_stat"),
-            (abnormal > 0).mean().alias("hit_rate"),
-        )
+        stats.join(cluster_sums, on=keys)
+        .with_columns(pl.when(g > 1).then(pl.col("mean") / clustered_se).alias("t_stat"))
+        .drop("sum_sq")
         .sort(pl.col("group") != ALL_ITEMS, "group", "horizon")
     )
 

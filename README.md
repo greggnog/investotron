@@ -79,6 +79,7 @@ datetimes.
 4. ~~Event study: average 1/5/20-day abnormal returns after an 8-K, split by item code~~
    (`uv run investotron event-study AAPL`)
 5. ~~Many tickers, reaction size, earnings surprise (SUE)~~
-6. Fitted beta instead of assuming beta = 1
-7. Standard errors that account for overlapping windows / same-day events
+6. ~~Fitted beta instead of assuming beta = 1~~ (`--model beta`, the default; `--model market` for beta = 1)
+7. ~~Standard errors that account for overlapping windows / same-day events~~
+   (clustered by calendar week; neighbouring weeks are still assumed independent)
 8. Survivorship: include delisted companies
