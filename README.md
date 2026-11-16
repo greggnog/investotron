@@ -21,6 +21,16 @@ SEC asks automated clients to identify themselves, so set
 
 ## Use
 
+**New to the market jargon?** Add `--explain` to any command for plain-English
+definitions of the terms and a sentence or two on what your numbers mean. To leave it
+on while you learn, set the environment variable instead, and remove it when you no
+longer need it:
+
+```powershell
+$env:INVESTOTRON_EXPLAIN = "1"        # this terminal only
+Remove-Item Env:INVESTOTRON_EXPLAIN   # back to the compact output
+```
+
 Every command takes tickers, a `--universe` file (one ticker per line), or both.
 Fetches skip tickers already downloaded unless you pass `--refresh`, so an
 interrupted run (e.g. a Tiingo rate limit) can just be rerun.

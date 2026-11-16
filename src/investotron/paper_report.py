@@ -12,6 +12,7 @@ import polars as pl
 
 from investotron.datastore import Paths, load_ticker, write_frame
 from investotron.event_study import Model
+from investotron.explain import Narrator, rule_takeaway
 from investotron.paper import (
     LockEntry,
     Rule,
@@ -82,8 +83,11 @@ def _positions_table(trades: pl.DataFrame, horizon: int) -> pl.DataFrame:
     )
 
 
-def _print_rule(rule: Rule, entry: LockEntry, results: _RuleResults, now: datetime) -> None:
+def _print_rule(
+    rule: Rule, entry: LockEntry, results: _RuleResults, now: datetime, narrator: Narrator
+) -> None:
     print(f"\n== {rule.name}: {_describe(rule)}")
+    narrator.terms("paper trading", rule.direction.value, "horizon", "item")
     days_live = (now - entry.started_at).days
     print(f"   Live since {entry.started_at:%Y-%m-%d %H:%M} UTC ({days_live} days)")
 
@@ -99,6 +103,7 @@ def _print_rule(rule: Rule, entry: LockEntry, results: _RuleResults, now: dateti
         f"   Live: {finished.height} finished, {open_trades.height} open, "
         f"{pending.height} waiting for the next open"
     )
+    narrator.terms("live", "backtest", "status")
     if not pending.is_empty():
         for row in pending.sort("known_at").iter_rows(named=True):
             print(f"     pending: {row['ticker']} filed {row['known_at']:%Y-%m-%d %H:%M} UTC")
@@ -116,6 +121,10 @@ def _print_rule(rule: Rule, entry: LockEntry, results: _RuleResults, now: dateti
         return
     print("   Finished trades, live vs backtest (backtest = same rule on earlier filings):")
     _table(_stats_table(summary))
+    narrator.terms("P&L", "win %", "t")
+    stats = {row["sample"]: row for row in summary.iter_rows(named=True)}
+    for sentence in rule_takeaway(rule, stats, open_trades.height):
+        narrator.say(sentence)
 
 
 def _print_freshness(last_session: date, last_filing: datetime, book: RuleBook) -> None:
@@ -168,7 +177,7 @@ def _collect(
     return collected
 
 
-def run_paper(rules_path: Path, paths: Paths, now: datetime) -> None:
+def run_paper(rules_path: Path, paths: Paths, now: datetime, narrator: Narrator) -> None:
     try:
         book = load_rulebook(rules_path)
         entries, started = sync_lock(book.rules, rules_path.with_name(LOCK_FILE_NAME), now)
@@ -193,10 +202,16 @@ def run_paper(rules_path: Path, paths: Paths, now: datetime) -> None:
             f"{', '.join(collected.stopped)}. Stopped trading (acquired, delisted) or needs "
             "a refresh; open trades in these are marked at their last price."
         )
+        narrator.terms("stopped trading")
+    narrator.say(
+        "Below, each rule is a simple trading idea being tested without real money. The key "
+        "comparison is 'live' (filings since the rule was written down) against 'backtest' "
+        "(the same rule on older filings). A rule only means something if it keeps working live."
+    )
 
     all_trades = [t for r in collected.results.values() for t in r.trades]
     if all_trades:
         write_frame(pl.concat(all_trades), paths.data_dir / "paper" / "trades.parquet")
     for rule in book.rules:
-        _print_rule(rule, entries[rule.name], collected.results[rule.name], now)
+        _print_rule(rule, entries[rule.name], collected.results[rule.name], now, narrator)
     print("\nP&L is hypothetical: beta-hedged vs the benchmark, no costs or slippage.")

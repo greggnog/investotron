@@ -26,6 +26,15 @@ from investotron.event_study import (
     summarize,
     summarize_reactions,
 )
+from investotron.explain import (
+    EXPLAIN_ENV,
+    Narrator,
+    direction_takeaway,
+    explain_enabled,
+    multiple_comparisons_takeaway,
+    size_takeaway,
+    surprise_takeaway,
+)
 from investotron.fundamentals import parse_quarterly_eps
 from investotron.identifiers import Ticker
 from investotron.paper_report import run_paper
@@ -60,9 +69,15 @@ def _require_env(name: str) -> str:
 # --- fetching ---------------------------------------------------------------
 
 
-def fetch_edgar(tickers: list[Ticker], refresh: bool, paths: Paths) -> None:
+def fetch_edgar(tickers: list[Ticker], refresh: bool, paths: Paths, narrator: Narrator) -> None:
     """8-K filings and quarterly EPS for each ticker."""
     user_agent = _require_env(USER_AGENT_ENV)
+    narrator.say(
+        "Downloading each company's 8-K filings and quarterly earnings from the SEC's free "
+        "EDGAR database. Each line below says how many 8-Ks and how many quarters of "
+        "earnings-per-share figures were saved for that stock."
+    )
+    narrator.terms("ticker", "8-K", "EPS")
     with EdgarClient(user_agent) as edgar:
         for ticker in tickers:
             if not refresh and paths.filings(ticker).exists() and paths.eps(ticker).exists():
@@ -85,8 +100,15 @@ def fetch_edgar(tickers: list[Ticker], refresh: bool, paths: Paths) -> None:
             print(f"{ticker}: {filings.height} 8-Ks, {eps.height} quarters of EPS")
 
 
-def fetch_prices(tickers: list[Ticker], start: date, refresh: bool, paths: Paths) -> None:
+def fetch_prices(
+    tickers: list[Ticker], start: date, refresh: bool, paths: Paths, narrator: Narrator
+) -> None:
     api_key = _require_env(TIINGO_KEY_ENV)
+    narrator.say(
+        "Downloading daily prices (open, close, volume) from Tiingo. Each line says how many "
+        "trading days were saved for that stock and the date range they cover."
+    )
+    narrator.terms("ticker", "session")
     with TiingoClient(api_key) as tiingo:
         for ticker in tickers:
             if not refresh and paths.prices(ticker).exists():
@@ -156,7 +178,7 @@ def _reaction_table(summary: pl.DataFrame, label: pl.Expr) -> pl.DataFrame:
     )
 
 
-def _print_multiple_comparisons(summary: pl.DataFrame) -> None:
+def _print_multiple_comparisons(summary: pl.DataFrame, narrator: Narrator) -> None:
     """How many rows clear |t| > 2, vs how many would by luck alone."""
     rows = summary.filter(pl.col("group") != ALL_ITEMS).drop_nulls("t_stat")
     hits = rows.filter(pl.col("t_stat").abs() > 2).height  # noqa: PLR2004
@@ -165,6 +187,8 @@ def _print_multiple_comparisons(summary: pl.DataFrame) -> None:
         f"   {hits} of {rows.height} item rows have |t| > 2; about {expected:.1f} would by "
         "chance alone, and rows at different horizons of the same item aren't independent."
     )
+    narrator.terms("multiple comparisons")
+    narrator.say(multiple_comparisons_takeaway(hits, rows.height, expected))
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +237,7 @@ def _load_study(tickers: list[Ticker], config: StudyConfig, paths: Paths) -> Stu
     )
 
 
-def _print_header(data: StudyData, config: StudyConfig) -> None:
+def _print_header(data: StudyData, config: StudyConfig, narrator: Narrator) -> None:
     n_tickers = data.returns["ticker"].n_unique()
     n_events = data.returns.select("ticker", "accession_number").n_unique()
     print(
@@ -229,9 +253,16 @@ def _print_header(data: StudyData, config: StudyConfig) -> None:
         )
     else:
         print("Model: market-adjusted (beta = 1)")
+    narrator.say(
+        "This looks at every 8-K these companies filed and asks two questions: did the "
+        "stock beat or trail the market afterwards (section 1), and how big was the move "
+        "compared with a normal day (section 2)? Section 3 does the same for earnings "
+        "reports, split by whether results beat or missed."
+    )
+    narrator.terms("8-K", "item", "benchmark", "beta", "session")
 
 
-def _print_surprise_section(data: StudyData) -> None:
+def _print_surprise_section(data: StudyData, narrator: Narrator) -> None:
     if data.earnings is None:
         print("\n3) SURPRISE: no EPS data yet -- run `investotron fetch-edgar` for these tickers.")
         return
@@ -240,20 +271,27 @@ def _print_surprise_section(data: StudyData) -> None:
         f"\n3) SURPRISE: {data.earnings.height} earnings 8-Ks, {rated} with a SUE "
         "(needs ~2 years of EPS history first)"
     )
+    narrator.say(
+        "Earnings reports (item 2.02) grouped by how good the results were. The first "
+        "table is the immediate reaction, the second is what happened after you could "
+        "actually trade."
+    )
+    narrator.terms("EPS", "SUE", "miss / beat")
     label = pl.lit("")
+    reactions = summarize_reactions(data.reactions.drop_nulls("surprise"), by="surprise")
+    returns = summarize(data.returns.drop_nulls("surprise"), by="surprise")
     _show(
         "   Size of the reaction, by surprise (SUE <= -1 miss, >= +1 beat)",
-        _reaction_table(
-            summarize_reactions(data.reactions.drop_nulls("surprise"), by="surprise"), label
-        ),
+        _reaction_table(reactions, label),
     )
-    _show(
-        "   Direction after entry, by surprise",
-        _direction_table(summarize(data.returns.drop_nulls("surprise"), by="surprise"), label),
-    )
+    _show("   Direction after entry, by surprise", _direction_table(returns, label))
+    for sentence in surprise_takeaway(reactions, returns):
+        narrator.say(sentence)
 
 
-def event_study(tickers: list[Ticker], config: StudyConfig, paths: Paths) -> None:
+def event_study(
+    tickers: list[Ticker], config: StudyConfig, paths: Paths, narrator: Narrator
+) -> None:
     data = _load_study(tickers, config, paths)
 
     tag = tickers[0].value if len(tickers) == 1 else f"{len(tickers)}_tickers"
@@ -261,7 +299,7 @@ def event_study(tickers: list[Ticker], config: StudyConfig, paths: Paths) -> Non
     write_frame(data.returns, paths.results(f"event_returns_{tag}.parquet"))
     write_frame(data.reactions, paths.results(f"event_reactions_{tag}.parquet"))
 
-    _print_header(data, config)
+    _print_header(data, config, narrator)
     keep = (pl.col("group") == ALL_ITEMS) | (pl.col("n") >= config.min_events)
     direction = summarize(data.returns).filter(keep)
     _show(
@@ -269,16 +307,30 @@ def event_study(tickers: list[Ticker], config: StudyConfig, paths: Paths) -> Non
         f"(items with n >= {config.min_events}; t clustered by calendar weeks)",
         _direction_table(direction, _describe(pl.col("group"))),
     )
-    _print_multiple_comparisons(direction)
+    narrator.say(
+        "Each row: if you had bought the stock at the first opportunity after this kind "
+        "of filing and held it for 'days' trading days, how did it do compared with the "
+        "market?"
+    )
+    narrator.terms("abnormal return", "n", "mean %", "median %", "t naive", "t", "weeks", "hit %")
+    for sentence in direction_takeaway(direction, EIGHT_K_ITEMS):
+        narrator.say(sentence)
+    _print_multiple_comparisons(direction, narrator)
+    size = summarize_reactions(data.reactions).filter(keep)
     _show(
         "2) SIZE: move from last close before the filing to the entry-day close, "
         f"vs normal volatility (no-news reference: mean |z| ~{NULL_MEAN_ABS_Z:.1f}, "
         f"|z|>2 ~{NULL_SHARE_ABOVE_2:.0%})",
-        _reaction_table(
-            summarize_reactions(data.reactions).filter(keep), _describe(pl.col("group"))
-        ),
+        _reaction_table(size, _describe(pl.col("group"))),
     )
-    _print_surprise_section(data)
+    narrator.say(
+        "Ignoring direction: how much did the price jump around the filing, including the "
+        "overnight gap, compared with how much this stock normally moves in a day?"
+    )
+    narrator.terms("overnight gap", "z", "mean |z|", "|z|>2 %", "mean |move| %", "mean move %")
+    for sentence in size_takeaway(size, EIGHT_K_ITEMS):
+        narrator.say(sentence)
+    _print_surprise_section(data, narrator)
 
 
 # --- argument parsing ---------------------------------------------------------
@@ -293,14 +345,25 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="investotron")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     commands = parser.add_subparsers(dest="command", required=True)
+    explain = argparse.ArgumentParser(add_help=False)
+    explain.add_argument(
+        "--explain",
+        action="store_true",
+        help=f"explain terms and results in plain English (or set {EXPLAIN_ENV}=1)",
+    )
 
     edgar = commands.add_parser(
-        "fetch-edgar", aliases=["fetch-8k"], help="download 8-K filings and quarterly EPS"
+        "fetch-edgar",
+        aliases=["fetch-8k"],
+        help="download 8-K filings and quarterly EPS",
+        parents=[explain],
     )
     _add_ticker_args(edgar)
     edgar.add_argument("--refresh", action="store_true", help="re-download existing data")
 
-    prices = commands.add_parser("fetch-prices", help="download daily prices from Tiingo")
+    prices = commands.add_parser(
+        "fetch-prices", help="download daily prices from Tiingo", parents=[explain]
+    )
     _add_ticker_args(prices)
     prices.add_argument("--refresh", action="store_true", help="re-download existing data")
     prices.add_argument(
@@ -310,7 +373,9 @@ def main(argv: list[str] | None = None) -> None:
         help=f"first session to fetch (default {DEFAULT_PRICES_START})",
     )
 
-    study = commands.add_parser("event-study", help="returns after 8-Ks, relative to a benchmark")
+    study = commands.add_parser(
+        "event-study", help="returns after 8-Ks, relative to a benchmark", parents=[explain]
+    )
     _add_ticker_args(study)
     study.add_argument("--benchmark", type=Ticker.parse, default=Ticker("SPY"))
     study.add_argument(
@@ -326,15 +391,18 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     paper = commands.add_parser(
-        "paper", help="paper-trade the rules in a rules file and report how they're doing"
+        "paper",
+        help="paper-trade the rules in a rules file and report how they're doing",
+        parents=[explain],
     )
     paper.add_argument(
         "--rules", type=Path, default=Path("paper/rules.toml"), help="rules file (TOML)"
     )
 
     args = parser.parse_args(argv)
+    narrator = Narrator(explain_enabled(args.explain, os.environ))
     if args.command == "paper":
-        run_paper(args.rules, Paths(args.data_dir), datetime.now(UTC))
+        run_paper(args.rules, Paths(args.data_dir), datetime.now(UTC), narrator)
         return
     try:
         tickers = resolve_tickers(args.tickers, args.universe)
@@ -343,9 +411,9 @@ def main(argv: list[str] | None = None) -> None:
     paths = Paths(args.data_dir)
 
     if args.command in ("fetch-edgar", "fetch-8k"):
-        fetch_edgar(tickers, args.refresh, paths)
+        fetch_edgar(tickers, args.refresh, paths, narrator)
     elif args.command == "fetch-prices":
-        fetch_prices(tickers, args.start, args.refresh, paths)
+        fetch_prices(tickers, args.start, args.refresh, paths, narrator)
     elif args.command == "event-study":
         config = StudyConfig(args.benchmark, args.horizons, args.min_events, args.model)
-        event_study(tickers, config, paths)
+        event_study(tickers, config, paths, narrator)
