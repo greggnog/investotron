@@ -354,3 +354,65 @@ def test_events_without_a_session_soon_after_are_dropped() -> None:
     before_history = datetime(2008, 8, 20, 16, 0, tzinfo=UTC)
     returns = event_returns(filings(("old", ["2.02"], before_history)), PRICES, [1])
     assert returns.height == 0
+
+
+def priced(days: list[date], closes: list[float], volumes: list[int] | None = None) -> pl.DataFrame:
+    vols = volumes or [1] * len(days)
+    return prices_frame(
+        [
+            DailyBar(Ticker("AAPL"), d, c, c, c, c, v, c, c)
+            for d, c, v in zip(days, closes, vols, strict=True)
+        ]
+    )
+
+
+def flat_bench(days: list[date]) -> pl.DataFrame:
+    return priced(days, [400.0] * len(days))
+
+
+# Mon 2024-01-08 .. Fri 01-12, then nothing until Mon 2024-03-04 (a 52-day break).
+BEFORE_BREAK = [date(2024, 1, d) for d in (8, 9, 10, 11, 12)]
+AFTER_BREAK = [date(2024, 3, d) for d in (4, 5, 6)]
+WITH_BREAK = BEFORE_BREAK + AFTER_BREAK
+
+
+def test_zero_volume_sessions_are_not_tradable() -> None:
+    # Halted after the 9th: the vendor repeats 50.0 with no volume.
+    days = BEFORE_BREAK
+    stock = priced(days, [100, 50, 50, 50, 60], [10, 10, 0, 0, 10])
+    prices = aligned_prices(stock, flat_bench(days), Model.MARKET)
+
+    assert prices["session"].to_list() == [date(2024, 1, d) for d in (8, 9, 12)]
+    assert prices["stock_daily"][2] == pytest.approx(60 / 50 - 1)  # 9th -> 12th, one real move
+
+
+def test_price_gap_starts_a_new_segment_and_nulls_the_return_across_it() -> None:
+    stock = priced(WITH_BREAK, [100, 101, 102, 103, 104, 1, 1.1, 1.2])
+    prices = aligned_prices(stock, flat_bench(WITH_BREAK), Model.MARKET)
+
+    assert prices["segment"].to_list() == [0] * 5 + [1] * 3
+    assert prices["stock_daily"][5] is None  # 104 -> 1 is not a daily return
+    assert prices["stock_daily"][6] == pytest.approx(0.1)
+
+
+def test_return_windows_never_cross_a_break() -> None:
+    stock = priced(WITH_BREAK, [100, 101, 102, 103, 104, 1, 1.1, 1.2])
+    prices = aligned_prices(stock, flat_bench(WITH_BREAK), Model.MARKET)
+    thursday_close = datetime(2024, 1, 10, 21, 30, tzinfo=UTC)  # entry Thu 11th
+
+    returns = event_returns(filings(("a", [], thursday_close)), prices, [1, 2, 3])
+
+    assert returns["horizon"].to_list() == [1, 2]  # 3 sessions would end in March
+
+
+def test_reaction_across_a_break_is_dropped() -> None:
+    days = [date(2023, 10, 2) + timedelta(days=i) for i in range(120)]
+    weekdays = [d for d in days if d.weekday() < 5][:60] + AFTER_BREAK
+    closes = [100.0 + (i % 2) for i in range(60)] + [1.0, 1.1, 1.2]
+    prices = aligned_prices(priced(weekdays, closes), flat_bench(weekdays), Model.MARKET)
+    # Filed during the gap, days before trading resumes: the entry (Mar 4) is soon
+    # enough, but the last close before it was in January, across the break.
+    during_gap = datetime(2024, 3, 1, 21, 0, tzinfo=UTC)
+    event = filings(("a", [], during_gap))
+    assert event_returns(event, prices, [1]).height == 1  # tradable from Mar 4
+    assert event_reactions(event, prices).height == 0

@@ -6,12 +6,13 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import httpx
 import polars as pl
 
+from investotron.datastore import Paths, load_ticker, write_frame
 from investotron.event_study import (
     ALL_ITEMS,
     BETA_SESSIONS,
@@ -20,16 +21,14 @@ from investotron.event_study import (
     NULL_MEAN_ABS_Z,
     NULL_SHARE_ABOVE_2,
     Model,
-    aligned_prices,
-    attach_surprises,
     event_reactions,
     event_returns,
     summarize,
     summarize_reactions,
-    surprise_bucket,
 )
-from investotron.fundamentals import earnings_surprises, parse_quarterly_eps
+from investotron.fundamentals import parse_quarterly_eps
 from investotron.identifiers import Ticker
+from investotron.paper_report import run_paper
 from investotron.sources.edgar import EIGHT_K_ITEMS, EdgarClient, parse_filings
 from investotron.sources.tiingo import (
     TiingoClient,
@@ -39,10 +38,8 @@ from investotron.sources.tiingo import (
 )
 from investotron.storage import (
     eps_frame,
-    eps_from_frame,
     filings_frame,
     prices_frame,
-    surprises_frame,
     write_raw_json,
 )
 from investotron.universe import resolve_tickers
@@ -58,31 +55,6 @@ def _require_env(name: str) -> str:
     if not value:
         sys.exit(f"Set {name} first (see .env.example).")
     return value
-
-
-@dataclass(frozen=True, slots=True)
-class Paths:
-    data_dir: Path
-
-    def filings(self, ticker: Ticker) -> Path:
-        return self.data_dir / "clean" / "edgar_8k" / f"{ticker}.parquet"
-
-    def eps(self, ticker: Ticker) -> Path:
-        return self.data_dir / "clean" / "eps_quarterly" / f"{ticker}.parquet"
-
-    def prices(self, ticker: Ticker) -> Path:
-        return self.data_dir / "clean" / "prices_daily" / f"{ticker}.parquet"
-
-    def raw(self, *parts: str) -> Path:
-        return self.data_dir.joinpath("raw", *parts)
-
-    def results(self, name: str) -> Path:
-        return self.data_dir / "results" / name
-
-
-def _write(frame: pl.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    frame.write_parquet(path)
 
 
 # --- fetching ---------------------------------------------------------------
@@ -108,8 +80,8 @@ def fetch_edgar(tickers: list[Ticker], refresh: bool, paths: Paths) -> None:
             write_raw_json(paths.raw("edgar", "companyfacts", f"CIK{cik.padded}.json"), facts)
             filings = filings_frame(parse_filings(cik, submissions))
             eps = eps_frame(parse_quarterly_eps(facts))
-            _write(filings, paths.filings(ticker))
-            _write(eps, paths.eps(ticker))
+            write_frame(filings, paths.filings(ticker))
+            write_frame(eps, paths.eps(ticker))
             print(f"{ticker}: {filings.height} 8-Ks, {eps.height} quarters of EPS")
 
 
@@ -133,7 +105,7 @@ def fetch_prices(tickers: list[Ticker], start: date, refresh: bool, paths: Paths
 
             write_raw_json(paths.raw("tiingo", "daily", f"{ticker}.json"), raw)
             frame = prices_frame(parse_daily_bars(ticker, raw))
-            _write(frame, paths.prices(ticker))
+            write_frame(frame, paths.prices(ticker))
             span = f"{frame['session'].min()} .. {frame['session'].max()}" if frame.height else ""
             print(f"{ticker}: {frame.height} sessions {span}")
 
@@ -220,33 +192,25 @@ def _load_study(tickers: list[Ticker], config: StudyConfig, paths: Paths) -> Stu
 
     returns: list[pl.DataFrame] = []
     reactions: list[pl.DataFrame] = []
-    surprised: list[pl.DataFrame] = []
+    earnings: list[pl.DataFrame] = []
     missing: list[str] = []
     for ticker in tickers:
-        if not (paths.filings(ticker).exists() and paths.prices(ticker).exists()):
+        data = load_ticker(ticker, bench, config.model, paths)
+        if data is None:
             missing.append(ticker.value)
             continue
-        filings = pl.read_parquet(paths.filings(ticker)).with_columns(
-            pl.lit(ticker.value).alias("ticker")
-        )
-        prices = aligned_prices(pl.read_parquet(paths.prices(ticker)), bench, config.model)
-        returns.append(event_returns(filings, prices, config.horizons))
-        reactions.append(event_reactions(filings, prices))
-        if paths.eps(ticker).exists():
-            quarters = eps_from_frame(pl.read_parquet(paths.eps(ticker)))
-            surprises = surprises_frame(earnings_surprises(quarters))
-            surprised.append(attach_surprises(filings, surprises))
+        returns.append(event_returns(data.filings, data.prices, config.horizons))
+        reactions.append(event_reactions(data.filings, data.prices))
+        if data.earnings is not None:
+            earnings.append(data.earnings)
 
     if not returns:
         sys.exit("No tickers have both 8-K and price data yet.")
     if missing:
         print(f"Skipped (not fetched yet): {', '.join(missing)}")
-    earnings = (
-        pl.concat(surprised).with_columns(surprise_bucket(pl.col("sue")).alias("surprise"))
-        if surprised
-        else None
+    return StudyData(
+        pl.concat(returns), pl.concat(reactions), pl.concat(earnings) if earnings else None
     )
-    return StudyData(pl.concat(returns), pl.concat(reactions), earnings)
 
 
 def _print_header(data: StudyData, config: StudyConfig) -> None:
@@ -271,22 +235,21 @@ def _print_surprise_section(data: StudyData) -> None:
     if data.earnings is None:
         print("\n3) SURPRISE: no EPS data yet -- run `investotron fetch-edgar` for these tickers.")
         return
-    rated = data.earnings.drop_nulls("surprise").select("ticker", "accession_number", "surprise")
+    rated = data.earnings.drop_nulls("surprise").height
     print(
-        f"\n3) SURPRISE: {data.earnings.height} earnings 8-Ks, {rated.height} with a SUE "
+        f"\n3) SURPRISE: {data.earnings.height} earnings 8-Ks, {rated} with a SUE "
         "(needs ~2 years of EPS history first)"
     )
-    keys = ["ticker", "accession_number"]
     label = pl.lit("")
     _show(
         "   Size of the reaction, by surprise (SUE <= -1 miss, >= +1 beat)",
         _reaction_table(
-            summarize_reactions(data.reactions.join(rated, on=keys), by="surprise"), label
+            summarize_reactions(data.reactions.drop_nulls("surprise"), by="surprise"), label
         ),
     )
     _show(
         "   Direction after entry, by surprise",
-        _direction_table(summarize(data.returns.join(rated, on=keys), by="surprise"), label),
+        _direction_table(summarize(data.returns.drop_nulls("surprise"), by="surprise"), label),
     )
 
 
@@ -295,8 +258,8 @@ def event_study(tickers: list[Ticker], config: StudyConfig, paths: Paths) -> Non
 
     tag = tickers[0].value if len(tickers) == 1 else f"{len(tickers)}_tickers"
     tag = f"{tag}_vs_{config.benchmark}_{config.model}"
-    _write(data.returns, paths.results(f"event_returns_{tag}.parquet"))
-    _write(data.reactions, paths.results(f"event_reactions_{tag}.parquet"))
+    write_frame(data.returns, paths.results(f"event_returns_{tag}.parquet"))
+    write_frame(data.reactions, paths.results(f"event_reactions_{tag}.parquet"))
 
     _print_header(data, config)
     keep = (pl.col("group") == ALL_ITEMS) | (pl.col("n") >= config.min_events)
@@ -362,7 +325,17 @@ def main(argv: list[str] | None = None) -> None:
         help="expected-return model: trailing beta (default) or beta = 1",
     )
 
+    paper = commands.add_parser(
+        "paper", help="paper-trade the rules in a rules file and report how they're doing"
+    )
+    paper.add_argument(
+        "--rules", type=Path, default=Path("paper/rules.toml"), help="rules file (TOML)"
+    )
+
     args = parser.parse_args(argv)
+    if args.command == "paper":
+        run_paper(args.rules, Paths(args.data_dir), datetime.now(UTC))
+        return
     try:
         tickers = resolve_tickers(args.tickers, args.universe)
     except (ValueError, OSError) as error:
