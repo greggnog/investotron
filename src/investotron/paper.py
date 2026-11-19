@@ -26,7 +26,7 @@ import json
 import re
 import tomllib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
@@ -218,18 +218,27 @@ def sync_lock(
 
 
 def rule_trades(
-    rule: Rule, filings: pl.DataFrame, prices: pl.DataFrame, started_at: datetime
+    rule: Rule,
+    filings: pl.DataFrame,
+    prices: pl.DataFrame,
+    started_at: datetime,
+    market_last_session: date | None = None,
 ) -> pl.DataFrame:
     """Every trade ``rule`` would have made on one stock's ``filings``.
 
     ``filings`` needs ``ticker``, ``accession_number``, ``items``, ``known_at`` and,
     for surprise rules, ``surprise``; ``prices`` comes from ``aligned_prices``.
     Open trades are marked at the latest close. ``live`` marks trades on filings
-    accepted at or after ``started_at``.
+    accepted at or after ``started_at``. If the stock's prices end before
+    ``market_last_session`` (acquired, delisted), its unfinished trades can never
+    finish, so they count as interrupted rather than open.
     """
     if prices.is_empty():
         return pl.DataFrame()
     last_index = cast("int", prices["session_index"].max())
+    stock_last_session = cast("date", prices["session"].max())
+    if market_last_session is not None and stock_last_session < market_last_session:
+        last_index = -1  # no segment is still running
     segment_ends = prices.group_by("segment").agg(
         pl.col("session_index").max().alias("segment_end")
     )

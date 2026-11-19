@@ -38,6 +38,7 @@ from investotron.explain import (
 from investotron.fundamentals import parse_quarterly_eps
 from investotron.identifiers import Ticker
 from investotron.paper_report import run_paper
+from investotron.plain import PLAIN_ENV, plain_enabled
 from investotron.sources.edgar import EIGHT_K_ITEMS, EdgarClient, parse_filings
 from investotron.sources.tiingo import (
     TiingoClient,
@@ -398,11 +399,22 @@ def main(argv: list[str] | None = None) -> None:
     paper.add_argument(
         "--rules", type=Path, default=Path("paper/rules.toml"), help="rules file (TOML)"
     )
+    paper.add_argument(
+        "--plain",
+        action="store_true",
+        help=f"short plain-English report with no tables (or set {PLAIN_ENV}=1)",
+    )
 
     args = parser.parse_args(argv)
     narrator = Narrator(explain_enabled(args.explain, os.environ))
     if args.command == "paper":
-        run_paper(args.rules, Paths(args.data_dir), datetime.now(UTC), narrator)
+        run_paper(
+            args.rules,
+            Paths(args.data_dir),
+            datetime.now(UTC),
+            narrator,
+            plain_english=plain_enabled(args.plain, os.environ),
+        )
         return
     try:
         tickers = resolve_tickers(args.tickers, args.universe)

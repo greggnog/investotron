@@ -185,6 +185,17 @@ def test_trade_still_running_is_open_and_marked_at_latest_close() -> None:
     assert row["pnl"] == pytest.approx(-0.10)
 
 
+def test_unfinished_trade_in_a_stock_that_stopped_trading_is_interrupted() -> None:
+    prices = prices_for([100, 100, 100, 100, 100, 100, 110])
+    events = filings(("a", ["1.02"], after_close(DAYS[5])))
+    market_continues = date(2024, 1, 17)
+    row = rule_trades(SHORT_102, events, prices, T0, market_continues).row(0, named=True)
+    assert row["status"] == Status.INTERRUPTED
+    assert row["exit_session"] == DAYS[6]
+    row = rule_trades(SHORT_102, events, prices, T0, DAYS[6]).row(0, named=True)
+    assert row["status"] == Status.OPEN  # stock is current: still running
+
+
 def test_trade_cut_short_by_a_price_break_is_interrupted() -> None:
     days = [*DAYS[:3], date(2024, 3, 4), date(2024, 3, 5)]  # break after Wed Jan 10
     prices = prices_for([100, 100, 95, 1, 1], days)

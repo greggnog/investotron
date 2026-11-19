@@ -31,6 +31,12 @@ $env:INVESTOTRON_EXPLAIN = "1"        # this terminal only
 Remove-Item Env:INVESTOTRON_EXPLAIN   # back to the compact output
 ```
 
+For the paper-trading report there's a simpler step before that: `paper --plain` (or
+`INVESTOTRON_PLAIN=1`) drops the tables and statistics and describes each idea and
+each trade in everyday sentences, e.g. "ULTA rose 3.1% and the market rose 0.8%, so it
+did 2.3% better than the market. The bet is winning 2.3% so far (past trades like this
+averaged -0.2%)."
+
 Every command takes tickers, a `--universe` file (one ticker per line), or both.
 Fetches skip tickers already downloaded unless you pass `--refresh`, so an
 interrupted run (e.g. a Tiingo rate limit) can just be rerun.
@@ -58,11 +64,22 @@ uv run investotron event-study --universe universes/starter.txt
 
 ### Paper trading
 
+**Daily routine:** once each evening, after the 4 pm Eastern close (Tiingo usually has
+the day's prices by then), run:
+
 ```bash
 uv run investotron fetch-edgar --universe universes/starter.txt --refresh
 uv run investotron fetch-prices SPY --universe universes/starter.txt --refresh
 uv run investotron paper
 ```
+
+`--refresh` is what picks up new filings and prices: without it the fetches skip every
+ticker that's already on disk and download nothing. It re-downloads each ticker's
+full history, which takes a minute or so for the starter universe. After that, run
+`paper` as often as you like without fetching again: it reads what's on disk, and its
+first line shows how current that data is. Most nights only open positions move;
+new trades appear only when a filing matches a rule. Add `--plain` for the same report
+in everyday sentences.
 
 Rules live in [`paper/rules.toml`](paper/rules.toml): "go long/short at the first open
 after an 8-K with item X, hold N sessions", optionally limited to earnings misses or
@@ -79,7 +96,8 @@ What keeps it honest:
   starts a fresh record.
 - Trades are recomputed from the data on every run, so there's no ledger to drift.
   Stocks whose prices stop early (acquired, delisted) are flagged, and trades cut
-  short by a break in prices are marked `interrupted` at the last tradable close.
+  short by a break in prices, or by the stock no longer trading, are marked
+  `interrupted` at the last tradable close.
 
 P&L is the beta-hedged abnormal return, signed by direction, with no costs, borrow
 fees or slippage. It's a test of whether a pattern holds up on data nobody had seen,
